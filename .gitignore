@@ -1,0 +1,30 @@
+# Виртуальные окружения
+env/
+venv/
+.venv/
+
+# Ключи и секреты
+*.json
+*.pem
+*.p12
+.env
+secrets/
+secret/
+*.key
+
+# Python-мусор
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Логи
+*.log
+
+# macOS
+.DS_Store
+
+#прочие папки и файлы
+*.pdf
+*.db
+links.txt

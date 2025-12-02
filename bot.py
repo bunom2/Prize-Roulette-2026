@@ -111,16 +111,20 @@ def mark_token_used_sheet(row, col):
     ws.update_cell(row, col, 'used')
 
 # --- WEB SERVER & KEEP ALIVE (Пункт 1) ---
+# Глобальная переменная для управления сервером
+web_runner = None
+
 async def health_check(request):
     return web.Response(text="Bot is running OK!")
 
 async def start_web_server():
+    global web_runner
     app = web.Application()
     app.router.add_get('/', health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
+    web_runner = web.AppRunner(app)
+    await web_runner.setup()
     port = int(os.getenv("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
+    site = web.TCPSite(web_runner, '0.0.0.0', port)
     await site.start()
     logging.info(f"Web server started on port {port}")
 
@@ -281,6 +285,15 @@ async def on_startup(dp):
     asyncio.create_task(keep_alive())
     await start_web_server()
 
+async def on_shutdown(dp):
+    logging.warning('Shutting down bot...')
+    # Корректно останавливаем веб-сервер
+    if web_runner:
+        await web_runner.cleanup()
+        logging.info("Web server stopped")
+    await bot.close()
+    logging.warning('Bot stopped')
+
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
     

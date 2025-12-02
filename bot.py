@@ -4,6 +4,8 @@ import uuid
 import os
 import random
 import json
+import signal
+import sys
 from datetime import datetime
 
 import gspread
@@ -13,7 +15,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils import executor
-from aiogram.utils.exceptions import MessageNotModified
+from aiogram.utils.exceptions import MessageNotModified, TerminatedByOtherGetUpdates
 from dotenv import load_dotenv
 
 # --- КОНФИГУРАЦИЯ ---
@@ -72,7 +74,6 @@ def record_winner(user: types.User, prize: dict):
     ]
     ws_winners.append_row(row)
     
-    # Лог для контроля
     logging.info(f"Пользователь ({username}, {user.id}) выиграл {prize['Название приза']}")
 
 # --- TOKENS IN GOOGLE SHEETS ---
@@ -244,17 +245,24 @@ async def process_spin(callback_query: types.CallbackQuery):
         await bot.send_message(callback_query.from_user.id, "Произошла ошибка при обработке.")
 
 async def on_startup(dp):
-    asyncio.create_task(keep_alive())
-    # 1. Запускаем веб-сервер, чтобы Render увидел, что мы живы
-    await start_web_server()
+    # Настройка обработки сигналов (чтобы старый бот умирал быстро)
+    def handle_signal(sig, frame):
+        logging.warning(f"Получен сигнал {sig}. Останавливаемся...")
+        asyncio.create_task(on_shutdown(dp))
     
-    # 2. Удаляем вебхук на всякий случай
+    # Регистрируем обработчики сигналов, если мы не на Windows
+    if sys.platform != "win32":
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+
+    asyncio.create_task(keep_alive())
+    await start_web_server()
     await bot.delete_webhook(drop_pending_updates=True)
 
-    # 3. ХИТРОСТЬ: Ждем 15 секунд, чтобы старый бот успел умереть, 
-    # пока Render переключает трафик.
-    logging.info("⏳ Пауза 15 сек перед запуском Polling (ждем завершения старой версии)...")
-    await asyncio.sleep(15)
+    # Ждем 40 секунд. За это время Render переключит трафик на порт 10000,
+    # а старый контейнер получит SIGTERM и умрет.
+    logging.info("⏳ Пауза 40 сек перед стартом Polling (Safe Deploy)...")
+    await asyncio.sleep(40)
     logging.info("🚀 Старт Polling!")
 
 async def on_shutdown(dp):
@@ -262,8 +270,17 @@ async def on_shutdown(dp):
     if web_runner:
         await web_runner.cleanup()
     await bot.close()
-    logging.warning('Bot stopped')
+    await dp.storage.close()
+    await dp.storage.wait_closed()
+    logging.warning('Bot stopped completely.')
 
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
-    
+    # Используем start_polling, но с нашим on_startup, где есть sleep
+    try:
+        executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
+    except TerminatedByOtherGetUpdates:
+        # Если вдруг даже 40 секунд не хватило (редкость), мы просто выйдем,
+        # и Render перезапустит контейнер сам.
+        logging.error("Конфликт обновлений. Перезапуск...")
+        sys.exit(1)
+        

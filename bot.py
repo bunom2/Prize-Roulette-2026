@@ -190,18 +190,49 @@ async def cmd_start(message: types.Message):
     
     if status == 'active':
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🎰 Испытать удачу! 🎰", callback_data=f"spin:{token}"))
-        await message.answer("Добро пожаловать!", reply_markup=markup)
+        # ЭТАП 1: Кнопка запуска
+        markup.add(types.InlineKeyboardButton("🚀 Запустить систему розыгрыша", callback_data=f"step1:{token}"))
+        await message.answer("👋 Привет! Ты в шаге от приза.\n\nСистема готова. Начинаем?", reply_markup=markup)
     elif status == 'used':
         await message.answer("Эта ссылка уже была использована.")
     else:
         await message.answer("Неверная ссылка или ошибка доступа к таблице.")
 
+# --- НОВЫЕ ХЕНДЛЕРЫ ДЛЯ ИНТЕРАКТИВА ---
+
+@dp.callback_query_handler(lambda c: c.data.startswith('step1:'))
+async def process_step_1(callback_query: types.CallbackQuery):
+    token = callback_query.data.split(":")[1]
+    
+    # Имитация бурной деятельности системы
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("⚡ Зарядить на удачу ⚡", callback_data=f"step2:{token}"))
+    
+    await callback_query.message.edit_text(
+        "📡 Связь с космосом установлена...\n🔄 Калибровка удачи... [████░░]\n🔎 Поиск лучших призов...", 
+        reply_markup=markup
+    )
+
+@dp.callback_query_handler(lambda c: c.data.startswith('step2:'))
+async def process_step_2(callback_query: types.CallbackQuery):
+    token = callback_query.data.split(":")[1]
+    
+    # Финальная готовность
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🎰 КРУТИТЬ РУЛЕТКУ! 🎰", callback_data=f"spin:{token}"))
+    
+    await callback_query.message.edit_text(
+        "🔋 Энергия: 100%\n🍀 Удача: МАКСИМУМ\n🔥 Система готова к выдаче приза!", 
+        reply_markup=markup
+    )
+
+# --- ФИНАЛЬНЫЙ СПИН ---
+
 @dp.callback_query_handler(lambda c: c.data.startswith('spin:'))
 async def process_spin(callback_query: types.CallbackQuery):
     token = callback_query.data.split(":")[1]
     
-    # 1. Повторная проверка в таблице
+    # 1. Повторная проверка в таблице (Security check)
     status, row_idx, col_idx = check_token_status_sheet(token)
     
     if status != 'active':
@@ -210,6 +241,8 @@ async def process_spin(callback_query: types.CallbackQuery):
         return
 
     await callback_query.message.edit_reply_markup(reply_markup=None)
+    
+    # Вау-эффект: сначала анимация
     await bot.send_dice(callback_query.from_user.id, emoji='🎰')
     await asyncio.sleep(2.5)
     
@@ -217,21 +250,27 @@ async def process_spin(callback_query: types.CallbackQuery):
         prizes = get_prizes_from_sheet()
         if not prizes:
              await bot.send_message(callback_query.from_user.id, "Призы закончились! 😔")
-             # Маркируем как used даже если нет приза
              if row_idx and col_idx:
                  mark_token_used_sheet(row_idx, col_idx)
              return
 
         won_prize = random.choice(prizes)
         
-        # Запись победителя + Лог выигрыша (внутри функции)
+        # Запись победителя + Лог выигрыша
         record_winner(callback_query.from_user, won_prize)
         
-        # Обновление статуса токена в таблице
+        # Обновление статуса
         if row_idx and col_idx:
             mark_token_used_sheet(row_idx, col_idx)
-            
-        await bot.send_message(callback_query.from_user.id, f"🎉 Ваш приз: <b>{won_prize['Название приза']}</b>", parse_mode="HTML")
+        
+        # Вау-эффект: Фейерверк и поздравление
+        await bot.send_message(
+            callback_query.from_user.id, 
+            f"🎇🎇🎇 <b>БА-БАХ! ЕСТЬ КОНТАКТ!</b> 🎇🎇🎇\n\n"
+            f"🎁 Ваш приз: <b>{won_prize['Название приза']}</b>\n\n"
+            f"🥳 Поздравляем с победой!", 
+            parse_mode="HTML"
+        )
         
     except Exception as e:
         logging.error(f"Error process_spin: {e}")

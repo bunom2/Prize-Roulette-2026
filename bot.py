@@ -13,6 +13,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils import executor
+from aiogram.utils.exceptions import MessageNotModified  # Добавлен импорт исключения
 from dotenv import load_dotenv
 
 # --- КОНФИГУРАЦИЯ ---
@@ -244,7 +245,11 @@ async def process_spin(callback_query: types.CallbackQuery):
         await callback_query.message.delete()
         return
 
-    await callback_query.message.edit_reply_markup(reply_markup=None)
+    # Защита от MessageNotModified (двойной клик)
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=None)
+    except MessageNotModified:
+        pass # Игнорируем, если кнопка уже убрана
     
     # Вау-эффект: сначала анимация
     await bot.send_dice(callback_query.from_user.id, emoji='🎰')

@@ -1,6 +1,5 @@
 import logging
 import asyncio
-import sqlite3
 import uuid
 import os
 import random
@@ -8,12 +7,13 @@ import json
 from datetime import datetime
 
 import gspread
+import aiohttp
+from aiohttp import web
 from oauth2client.service_account import ServiceAccountCredentials
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils import executor
 from dotenv import load_dotenv
-from aiohttp import web  # Добавили для Render
 
 # --- КОНФИГУРАЦИЯ ---
 load_dotenv()
@@ -26,7 +26,6 @@ logging.basicConfig(level=logging.INFO)
 # --- GOOGLE SHEETS API ---
 def get_gspread_client():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    # На Render файл может лежать в другой папке, проверяем это
     filename = "service_account.json"
     if not os.path.exists(filename):
         logging.error(f"Файл {filename} не найден! Проверьте Secret Files на Render.")
@@ -35,6 +34,7 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 def get_prizes_from_sheet():
+    """Получает список доступных призов."""
     client = get_gspread_client()
     sheet = client.open_by_key(SHEET_ID).worksheet("Prizes")
     all_records = sheet.get_all_records()
@@ -52,53 +52,65 @@ def get_prizes_from_sheet():
     return available_prizes
 
 def record_winner(user: types.User, prize: dict):
+    """Записывает победителя в таблицу."""
     client = get_gspread_client()
     sh = client.open_by_key(SHEET_ID)
+    
+    # 1. Обновляем счетчик призов
     ws_prizes = sh.worksheet("Prizes")
     ws_prizes.update_cell(prize['row_idx'], 4, int(prize['Выдано']) + 1)
     
+    # 2. Добавляем запись в Winners
     ws_winners = sh.worksheet("Winners")
+    username = f"@{user.username}" if user.username else "NoUsername"
     row = [
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         user.id,
-        f"@{user.username}" if user.username else "NoUsername",
+        username,
         prize['Название приза']
     ]
     ws_winners.append_row(row)
+    
+    # Лог для контроля (Пункт 2)
+    logging.info(f"Пользователь ({username}, {user.id}) выиграл {prize['Название приза']}")
 
-# --- SQLITE DATABASE (LOCAL) ---
-DB_NAME = "roulette.db"
+# --- TOKENS IN GOOGLE SHEETS (Пункт 3) ---
+# Вместо SQLite используем лист "Tokens"
+# Структура листа: Колонка A - Токен, Колонка B - Статус
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS tokens (token TEXT PRIMARY KEY, status TEXT DEFAULT 'active')")
-    conn.commit()
-    conn.close()
+def add_tokens_to_sheet(tokens):
+    """Добавляет пачку новых токенов в таблицу."""
+    client = get_gspread_client()
+    ws = client.open_by_key(SHEET_ID).worksheet("Tokens")
+    
+    # Подготавливаем данные: [[token1, 'active'], [token2, 'active'], ...]
+    data = [[t, 'active'] for t in tokens]
+    ws.append_rows(data)
 
-def add_tokens_batch(tokens):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.executemany("INSERT OR IGNORE INTO tokens (token, status) VALUES (?, ?)", [(t, 'active') for t in tokens])
-    conn.commit()
-    conn.close()
+def check_token_status_sheet(token):
+    """Проверяет статус токена в таблице."""
+    client = get_gspread_client()
+    ws = client.open_by_key(SHEET_ID).worksheet("Tokens")
+    
+    try:
+        # Ищем ячейку с токеном. find вернет объект Cell или None
+        cell = ws.find(token)
+        if cell:
+            # Статус находится в следующей колонке (col + 1)
+            status = ws.cell(cell.row, cell.col + 1).value
+            return status, cell.row, cell.col + 1
+    except Exception as e:
+        logging.error(f"Ошибка поиска токена: {e}")
+    
+    return None, None, None
 
-def check_token_status(token):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT status FROM tokens WHERE token = ?", (token,))
-    result = cur.fetchone()
-    conn.close()
-    return result[0] if result else None
+def mark_token_used_sheet(row, col):
+    """Помечает токен как used по координатам ячейки статуса."""
+    client = get_gspread_client()
+    ws = client.open_by_key(SHEET_ID).worksheet("Tokens")
+    ws.update_cell(row, col, 'used')
 
-def mark_token_used(token):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("UPDATE tokens SET status = 'used' WHERE token = ?", (token,))
-    conn.commit()
-    conn.close()
-
-# --- DUMMY WEB SERVER (Для Render Web Service) ---
+# --- WEB SERVER & KEEP ALIVE (Пункт 1) ---
 async def health_check(request):
     return web.Response(text="Bot is running OK!")
 
@@ -107,11 +119,29 @@ async def start_web_server():
     app.router.add_get('/', health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render передает порт через переменную окружения PORT
     port = int(os.getenv("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logging.info(f"Web server started on port {port}")
+
+async def keep_alive():
+    """Пингует сам себя каждые 9 минут."""
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        logging.info("RENDER_EXTERNAL_URL не найден, пропускаем self-ping")
+        return
+
+    logging.info(f"Запущен Keep-Alive пингер для {url} (интервал 9 минут)")
+    while True:
+        await asyncio.sleep(9 * 60) # 9 минут (Пункт 1)
+        try:
+            logging.info(f"Отправка keep-alive пинга на {url}...")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    # Логи для контроля (Пункт 1)
+                    logging.info(f"Keep-alive пинг успешен. Status: {resp.status}")
+        except Exception as e:
+            logging.error(f"Keep-alive ошибка: {e}")
 
 # --- БОТ ИНИЦИАЛИЗАЦИЯ ---
 bot = Bot(token=BOT_TOKEN)
@@ -119,60 +149,97 @@ dp = Dispatcher(bot, storage=MemoryStorage())
 
 @dp.message_handler(commands=['generate'], user_id=ADMIN_IDS)
 async def cmd_generate(message: types.Message):
+    """Генерация ссылок и запись в Google Таблицу."""
     try:
         count = int(message.get_args())
     except (ValueError, TypeError):
         await message.reply("Использование: /generate <N>")
         return
+    
+    # Генерируем короткие UUID
     new_tokens = [str(uuid.uuid4())[:8] for _ in range(count)]
-    add_tokens_batch(new_tokens)
+    
+    # Сохраняем в Google Sheet вместо SQLite
+    try:
+        await message.reply("Сохраняю токены в Google Таблицу (лист Tokens)... Ждите.")
+        add_tokens_to_sheet(new_tokens)
+    except Exception as e:
+        logging.error(f"Ошибка записи токенов: {e}")
+        await message.reply("Ошибка при записи в таблицу. Проверьте, создан ли лист 'Tokens'.")
+        return
+
+    # Лог для контроля (Пункт 2)
+    logging.info(f"сгенерированы {count} штук ссылок")
+    
     bot_username = (await bot.get_me()).username
     lines = [f"https://t.me/{bot_username}?start={t}" for t in new_tokens]
+    
     with open("links.txt", "w") as f: f.write("\n".join(lines))
-    await message.reply_document(open("links.txt", "rb"), caption=f"Сгенерировано {count}.")
+    await message.reply_document(open("links.txt", "rb"), caption=f"Сгенерировано и сохранено в облако {count} ссылок.")
     os.remove("links.txt")
 
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     token = message.get_args()
     if not token:
-        await message.answer("Нужна ссылка.")
+        await message.answer("Для участия нужна ссылка.")
         return
-    status = check_token_status(token)
+
+    # Проверка статуса через Google Таблицу
+    status, _, _ = check_token_status_sheet(token)
+    
     if status == 'active':
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("🎰 Испытать удачу! 🎰", callback_data=f"spin:{token}"))
         await message.answer("Добро пожаловать!", reply_markup=markup)
+    elif status == 'used':
+        await message.answer("Эта ссылка уже была использована.")
     else:
-        await message.answer("Ссылка недействительна или уже использована.")
+        await message.answer("Неверная ссылка или ошибка доступа к таблице.")
 
 @dp.callback_query_handler(lambda c: c.data.startswith('spin:'))
 async def process_spin(callback_query: types.CallbackQuery):
     token = callback_query.data.split(":")[1]
-    if check_token_status(token) != 'active':
-        await bot.answer_callback_query(callback_query.id, "Уже неактивно.")
+    
+    # 1. Повторная проверка в таблице
+    status, row_idx, col_idx = check_token_status_sheet(token)
+    
+    if status != 'active':
+        await bot.answer_callback_query(callback_query.id, "Ссылка неактивна.")
         await callback_query.message.delete()
         return
+
     await callback_query.message.edit_reply_markup(reply_markup=None)
     await bot.send_dice(callback_query.from_user.id, emoji='🎰')
     await asyncio.sleep(2.5)
+    
     try:
         prizes = get_prizes_from_sheet()
         if not prizes:
              await bot.send_message(callback_query.from_user.id, "Призы закончились! 😔")
-             mark_token_used(token)
+             # Маркируем как used даже если нет приза
+             if row_idx and col_idx:
+                 mark_token_used_sheet(row_idx, col_idx)
              return
+
         won_prize = random.choice(prizes)
+        
+        # Запись победителя + Лог выигрыша (внутри функции)
         record_winner(callback_query.from_user, won_prize)
-        mark_token_used(token)
-        await bot.send_message(callback_query.from_user.id, f"🎉 Приз: <b>{won_prize['Название приза']}</b>", parse_mode="HTML")
+        
+        # Обновление статуса токена в таблице
+        if row_idx and col_idx:
+            mark_token_used_sheet(row_idx, col_idx)
+            
+        await bot.send_message(callback_query.from_user.id, f"🎉 Ваш приз: <b>{won_prize['Название приза']}</b>", parse_mode="HTML")
+        
     except Exception as e:
-        logging.error(f"Error: {e}")
-        await bot.send_message(callback_query.from_user.id, "Ошибка.")
+        logging.error(f"Error process_spin: {e}")
+        await bot.send_message(callback_query.from_user.id, "Произошла ошибка при обработке.")
 
 async def on_startup(dp):
-    init_db()
-    # Запускаем веб-сервер вместе с ботом
+    # init_db() больше не нужен, так как SQLite удален
+    asyncio.create_task(keep_alive())
     await start_web_server()
 
 if __name__ == '__main__':

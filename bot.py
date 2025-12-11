@@ -41,7 +41,7 @@ YANDEX_FILE_PATH = "roulette.xlsx" # Имя файла в корне Яндек�
 
 logging.basicConfig(level=logging.INFO)
 
-# Глобальная блокировка для файловых операций (критично для Яндекса)
+# Глобальная блокировка для операций с данными (чтобы не было гонки потоков)
 db_lock = asyncio.Lock()
 
 # --- КЛАСС ДЛЯ РАБОТЫ С ДАННЫМИ (АБСТРАКЦИЯ) ---
@@ -54,33 +54,40 @@ class DataManager:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         filename = "service_account.json"
         if not os.path.exists(filename):
-            logging.error(f"Файл {filename} не найден!")
+            logging.error(f"Файл {filename} не найден! Проверьте Secret Files на Render.")
         creds = ServiceAccountCredentials.from_json_keyfile_name(filename, scope)
         return gspread.authorize(creds)
 
+    # --- ОБЩИЕ МЕТОДЫ (ВЫЗЫВАЮТ СПЕЦИФИЧЕСКИЕ) ---
+
     @staticmethod
     async def get_prizes():
-        if DATA_SOURCE == 'google':
-            return DataManager._get_prizes_google()
-        elif DATA_SOURCE == 'yandex':
-            return await DataManager._get_prizes_yandex()
+        async with db_lock: # Блокируем доступ для других запросов, пока читаем
+            if DATA_SOURCE == 'google':
+                return DataManager._get_prizes_google()
+            elif DATA_SOURCE == 'yandex':
+                return await DataManager._get_prizes_yandex()
 
     @staticmethod
     async def record_winner(user, prize):
-        if DATA_SOURCE == 'google':
-            DataManager._record_winner_google(user, prize)
-        elif DATA_SOURCE == 'yandex':
-            await DataManager._record_winner_yandex(user, prize)
+        async with db_lock:
+            if DATA_SOURCE == 'google':
+                DataManager._record_winner_google(user, prize)
+            elif DATA_SOURCE == 'yandex':
+                await DataManager._record_winner_yandex(user, prize)
 
     @staticmethod
     async def add_tokens(tokens):
-        if DATA_SOURCE == 'google':
-            DataManager._add_tokens_google(tokens)
-        elif DATA_SOURCE == 'yandex':
-            await DataManager._add_tokens_yandex(tokens)
+        async with db_lock:
+            if DATA_SOURCE == 'google':
+                DataManager._add_tokens_google(tokens)
+            elif DATA_SOURCE == 'yandex':
+                await DataManager._add_tokens_yandex(tokens)
 
     @staticmethod
     async def check_token(token):
+        # Google читает быстро, блокировка может быть излишней, но для надежности оставим
+        # Для Яндекса блокировка критична (внутри методов)
         if DATA_SOURCE == 'google':
             return DataManager._check_token_google(token)
         elif DATA_SOURCE == 'yandex':
@@ -88,10 +95,11 @@ class DataManager:
 
     @staticmethod
     async def mark_token_used(token_data):
-        if DATA_SOURCE == 'google':
-            DataManager._mark_token_used_google(token_data)
-        elif DATA_SOURCE == 'yandex':
-            await DataManager._mark_token_used_yandex(token_data)
+        async with db_lock:
+            if DATA_SOURCE == 'google':
+                DataManager._mark_token_used_google(token_data)
+            elif DATA_SOURCE == 'yandex':
+                await DataManager._mark_token_used_yandex(token_data)
 
     # --- GOOGLE IMPLEMENTATION ---
     @staticmethod
@@ -102,7 +110,9 @@ class DataManager:
         available = []
         for idx, item in enumerate(all_records, start=2):
             try:
-                if int(item['Лимит']) - int(item['Выдано']) > 0:
+                limit = int(item['Лимит'])
+                issued = int(item['Выдано'])
+                if limit - issued > 0:
                     item['row_idx'] = idx
                     available.append(item)
             except ValueError: continue
@@ -112,13 +122,21 @@ class DataManager:
     def _record_winner_google(user, prize):
         client = DataManager.get_google_client()
         sh = client.open_by_key(GOOGLE_SHEET_ID)
+        # Обновляем счетчик призов
         sh.worksheet("Prizes").update_cell(prize['row_idx'], 4, int(prize['Выдано']) + 1)
-        row = [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user.id, f"@{user.username}" if user.username else "NoUsername", prize['Название приза']]
+        # Пишем победителя
+        row = [
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+            str(user.id), 
+            f"@{user.username}" if user.username else "NoUsername", 
+            prize['Название приза']
+        ]
         sh.worksheet("Winners").append_row(row)
 
     @staticmethod
     def _add_tokens_google(tokens):
         client = DataManager.get_google_client()
+        # Добавляем сразу пачкой
         client.open_by_key(GOOGLE_SHEET_ID).worksheet("Tokens").append_rows([[t, 'active'] for t in tokens])
 
     @staticmethod
@@ -128,12 +146,14 @@ class DataManager:
         try:
             cell = ws.find(token)
             if cell:
+                # Возвращаем статус, ряд, колонку статуса (она следующая за токеном)
                 return ws.cell(cell.row, cell.col + 1).value, cell.row, cell.col + 1
         except: pass
         return None, None, None
 
     @staticmethod
     def _mark_token_used_google(token_data):
+        # token_data = (status, row, col)
         row, col = token_data[1], token_data[2]
         if row and col:
             client = DataManager.get_google_client()
@@ -154,7 +174,7 @@ class DataManager:
         resp = requests.get(url, headers=DataManager._yandex_headers(), params=params)
         if resp.status_code != 200:
             logging.error(f"Yandex Download Error: {resp.text}")
-            raise Exception("Не удалось получить ссылку на файл")
+            raise Exception(f"Ошибка скачивания: {resp.status_code}")
         
         download_url = resp.json()['href']
         file_resp = requests.get(download_url)
@@ -178,70 +198,71 @@ class DataManager:
 
     @staticmethod
     async def _get_prizes_yandex():
-        async with db_lock: # Блокируем, чтобы никто не писал параллельно
-            try:
-                wb = openpyxl.load_workbook(DataManager._download_excel())
-                ws = wb['Prizes']
-                prizes = []
-                # Предполагаем структуру: A=ID, B=Name, C=Limit, D=Issued
-                for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-                    # row[0]=ID, row[1]=Name, row[2]=Limit, row[3]=Issued
-                    if row[1] and row[2] is not None:
-                        issued = row[3] if row[3] is not None else 0
-                        if int(row[2]) - int(issued) > 0:
-                            prizes.append({
-                                'Название приза': row[1],
-                                'Лимит': row[2],
-                                'Выдано': issued,
-                                'row_idx': row_idx
-                            })
-                return prizes
-            except Exception as e:
-                logging.error(f"Yandex Read Prizes Error: {e}")
-                return []
+        try:
+            # Скачиваем файл в память
+            wb = openpyxl.load_workbook(DataManager._download_excel())
+            ws = wb['Prizes']
+            prizes = []
+            # Предполагаем структуру: A=ID, B=Name, C=Limit, D=Issued
+            for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+                # row[0]=ID, row[1]=Name, row[2]=Limit, row[3]=Issued
+                if len(row) >= 3 and row[1] and row[2] is not None:
+                    issued = row[3] if len(row) > 3 and row[3] is not None else 0
+                    if int(row[2]) - int(issued) > 0:
+                        prizes.append({
+                            'Название приза': row[1],
+                            'Лимит': row[2],
+                            'Выдано': issued,
+                            'row_idx': row_idx
+                        })
+            return prizes
+        except Exception as e:
+            logging.error(f"Yandex Read Prizes Error: {e}")
+            return []
 
     @staticmethod
     async def _record_winner_yandex(user, prize):
-        async with db_lock:
-            wb = openpyxl.load_workbook(DataManager._download_excel())
-            
-            # 1. Обновляем Prizes
-            ws_prizes = wb['Prizes']
-            # cell(row, column). D=4
-            curr_val = ws_prizes.cell(row=prize['row_idx'], column=4).value
-            curr_val = int(curr_val) if curr_val else 0
-            ws_prizes.cell(row=prize['row_idx'], column=4).value = curr_val + 1
-            
-            # 2. Пишем в Winners
-            ws_winners = wb['Winners']
-            ws_winners.append([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                str(user.id),
-                f"@{user.username}" if user.username else "NoUsername",
-                prize['Название приза']
-            ])
-            
-            # Сохраняем и загружаем
-            buffer = io.BytesIO()
-            wb.save(buffer)
-            DataManager._upload_excel(buffer)
+        wb = openpyxl.load_workbook(DataManager._download_excel())
+        
+        # 1. Обновляем Prizes
+        ws_prizes = wb['Prizes']
+        # cell(row, column). D=4
+        curr_val = ws_prizes.cell(row=prize['row_idx'], column=4).value
+        curr_val = int(curr_val) if curr_val else 0
+        ws_prizes.cell(row=prize['row_idx'], column=4).value = curr_val + 1
+        
+        # 2. Пишем в Winners
+        if 'Winners' not in wb.sheetnames:
+            wb.create_sheet('Winners')
+        ws_winners = wb['Winners']
+        ws_winners.append([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            str(user.id),
+            f"@{user.username}" if user.username else "NoUsername",
+            prize['Название приза']
+        ])
+        
+        # Сохраняем и загружаем
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        DataManager._upload_excel(buffer)
 
     @staticmethod
     async def _add_tokens_yandex(tokens):
-        async with db_lock:
-            wb = openpyxl.load_workbook(DataManager._download_excel())
-            if 'Tokens' not in wb.sheetnames:
-                wb.create_sheet('Tokens')
-            ws = wb['Tokens']
-            for t in tokens:
-                ws.append([t, 'active'])
-            
-            buffer = io.BytesIO()
-            wb.save(buffer)
-            DataManager._upload_excel(buffer)
+        wb = openpyxl.load_workbook(DataManager._download_excel())
+        if 'Tokens' not in wb.sheetnames:
+            wb.create_sheet('Tokens')
+        ws = wb['Tokens']
+        for t in tokens:
+            ws.append([t, 'active'])
+        
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        DataManager._upload_excel(buffer)
 
     @staticmethod
     async def _check_token_yandex(token):
+        # В Яндексе мы блокируем чтение тоже, чтобы не прочитать старый файл, пока другой поток пишет
         async with db_lock:
             wb = openpyxl.load_workbook(DataManager._download_excel())
             if 'Tokens' not in wb.sheetnames:
@@ -251,28 +272,29 @@ class DataManager:
             for row_idx, row in enumerate(ws.iter_rows(min_row=1, values_only=True), start=1):
                 if row[0] == token:
                     # Возвращаем статус, row_idx, и сам объект token (не используется)
-                    return row[1], row_idx, None
+                    status = row[1] if len(row) > 1 else None
+                    return status, row_idx, None
             return None, None, None
 
     @staticmethod
     async def _mark_token_used_yandex(token_data):
         # token_data = (status, row_idx, _)
         row_idx = token_data[1]
-        async with db_lock:
-            wb = openpyxl.load_workbook(DataManager._download_excel())
-            ws = wb['Tokens']
-            # Статус в колонке B (2)
-            ws.cell(row=row_idx, column=2).value = 'used'
-            
-            buffer = io.BytesIO()
-            wb.save(buffer)
-            DataManager._upload_excel(buffer)
+        
+        wb = openpyxl.load_workbook(DataManager._download_excel())
+        ws = wb['Tokens']
+        # Статус в колонке B (2)
+        ws.cell(row=row_idx, column=2).value = 'used'
+        
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        DataManager._upload_excel(buffer)
 
 
 # --- WEB SERVER & KEEP ALIVE ---
 web_runner = None
 async def health_check(request):
-    return web.Response(text=f"Bot running. Source: {DATA_SOURCE}")
+    return web.Response(text=f"Bot running. Source: {DATA_SOURCE.upper()}")
 
 async def start_web_server():
     global web_runner
@@ -283,16 +305,18 @@ async def start_web_server():
     port = int(os.getenv("PORT", 8080))
     site = web.TCPSite(web_runner, '0.0.0.0', port)
     await site.start()
+    logging.info(f"Web server started on port {port}. Source: {DATA_SOURCE}")
 
 async def keep_alive():
     url = os.getenv("RENDER_EXTERNAL_URL")
     if not url: return
+    logging.info(f"Запущен Keep-Alive для {url}")
     while True:
         await asyncio.sleep(9 * 60)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
-                    logging.info(f"Keep-alive: {resp.status}")
+                    logging.info(f"Keep-alive status: {resp.status}")
         except: pass
 
 # --- БОТ ИНИЦИАЛИЗАЦИЯ ---
@@ -313,47 +337,49 @@ async def cmd_generate(message: types.Message):
         await DataManager.add_tokens(new_tokens)
     except Exception as e:
         logging.error(f"DB Error: {e}")
-        await message.reply("Ошибка записи базы данных.")
+        await message.reply("Ошибка записи базы данных (проверьте логи).")
         return
 
     bot_username = (await bot.get_me()).username
     lines = [f"https://t.me/{bot_username}?start={t}" for t in new_tokens]
     
     with open("links.txt", "w") as f: f.write("\n".join(lines))
-    await message.reply_document(open("links.txt", "rb"), caption=f"Готово: {count} шт. ({DATA_SOURCE})")
+    
+    caption = f"Готово: {count} шт. ({DATA_SOURCE.upper()})"
+    await message.reply_document(open("links.txt", "rb"), caption=caption)
     os.remove("links.txt")
 
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     token = message.get_args()
     if not token:
-        await message.answer("Нужна ссылка.")
+        await message.answer("Для участия нужна ссылка.")
         return
 
     status, row, col = await DataManager.check_token(token)
     
     if status == 'active':
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🚀 Запуск", callback_data=f"step1:{token}"))
+        markup.add(types.InlineKeyboardButton("🚀 Запустить систему", callback_data=f"step1:{token}"))
         await message.answer("👋 Привет! Система готова.", reply_markup=markup)
     elif status == 'used':
-        await message.answer("Ссылка уже использована.")
+        await message.answer("Эта ссылка уже была использована.")
     else:
-        await message.answer("Неверная ссылка.")
+        await message.answer("Неверная ссылка (или ошибка доступа к базе).")
 
 @dp.callback_query_handler(lambda c: c.data.startswith('step1:'))
 async def process_step_1(c: types.CallbackQuery):
     token = c.data.split(":")[1]
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("⚡ Зарядить ⚡", callback_data=f"step2:{token}"))
-    await c.message.edit_text("📡 Связь с базой данных...", reply_markup=markup)
+    markup.add(types.InlineKeyboardButton("⚡ Зарядить на удачу ⚡", callback_data=f"step2:{token}"))
+    await c.message.edit_text("📡 Связь с космосом установлена...\n🔄 Калибровка удачи... [████░░]\n🔎 Поиск лучших призов...", reply_markup=markup)
 
 @dp.callback_query_handler(lambda c: c.data.startswith('step2:'))
 async def process_step_2(c: types.CallbackQuery):
     token = c.data.split(":")[1]
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🎰 КРУТИТЬ! 🎰", callback_data=f"spin:{token}"))
-    await c.message.edit_text("🔋 Готовность 100%", reply_markup=markup)
+    markup.add(types.InlineKeyboardButton("🎰 КРУТИТЬ РУЛЕТКУ! 🎰", callback_data=f"spin:{token}"))
+    await c.message.edit_text("🔋 Энергия: 100%\n🍀 Удача: МАКСИМУМ\n🔥 Система готова к выдаче приза!", reply_markup=markup)
 
 @dp.callback_query_handler(lambda c: c.data.startswith('spin:'))
 async def process_spin(c: types.CallbackQuery):
@@ -373,7 +399,7 @@ async def process_spin(c: types.CallbackQuery):
     await asyncio.sleep(2.5)
     
     try:
-        # ВЫБОР И ЗАПИСЬ (С БЛОКИРОВКОЙ ВНУТРИ DATA MANAGER)
+        # ВЫБОР И ЗАПИСЬ
         prizes = await DataManager.get_prizes()
         if not prizes:
              await bot.send_message(c.from_user.id, "Призы закончились! 😔")
@@ -382,32 +408,55 @@ async def process_spin(c: types.CallbackQuery):
 
         won_prize = random.choice(prizes)
         
-        # ЗАПИСЬ
+        # ЗАПИСЬ ПОБЕДИТЕЛЯ
         await DataManager.record_winner(c.from_user, won_prize)
+        
+        # ГАШЕНИЕ ТОКЕНА
         if row: await DataManager.mark_token_used((status, row, col))
         
-        await bot.send_message(c.from_user.id, f"🎉 Твой приз: <b>{won_prize['Название приза']}</b>", parse_mode="HTML")
+        # ВАУ-ЭФФЕКТ
+        await bot.send_message(
+            c.from_user.id, 
+            f"🎇🎇🎇 <b>БА-БАХ! ЕСТЬ КОНТАКТ!</b> 🎇🎇🎇\n\n"
+            f"🎁 Твой приз: <b>{won_prize['Название приза']}</b>\n\n"
+            f"🥳 Поздравляем с победой!", 
+            parse_mode="HTML"
+        )
     except Exception as e:
-        logging.error(f"Error: {e}")
-        await bot.send_message(c.from_user.id, "Ошибка базы данных.")
+        logging.error(f"Error in spin: {e}")
+        await bot.send_message(c.from_user.id, "Произошла техническая ошибка.")
 
 async def on_startup(dp):
+    # Обработка сигналов остановки
     def handle_signal(sig, frame):
+        logging.warning(f"Получен сигнал {sig}. Останавливаемся...")
         asyncio.create_task(on_shutdown(dp))
+        
     if sys.platform != "win32":
         signal.signal(signal.SIGTERM, handle_signal)
         signal.signal(signal.SIGINT, handle_signal)
+
     asyncio.create_task(keep_alive())
     await start_web_server()
     await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Пауза для безопасного деплоя (убийства зомби)
+    logging.info("⏳ Пауза 40 сек перед стартом Polling (Safe Deploy)...")
     await asyncio.sleep(40)
+    logging.info("🚀 Старт Polling!")
 
 async def on_shutdown(dp):
+    logging.warning('Shutting down bot...')
     if web_runner: await web_runner.cleanup()
     await bot.close()
     await dp.storage.close()
     await dp.storage.wait_closed()
+    logging.warning('Bot stopped completely.')
 
 if __name__ == '__main__':
-    try: executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
-    except TerminatedByOtherGetUpdates: sys.exit(1)
+    try:
+        executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
+    except TerminatedByOtherGetUpdates:
+        logging.error("Конфликт обновлений. Перезапуск...")
+        sys.exit(1)
+        
